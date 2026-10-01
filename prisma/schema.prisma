@@ -1,0 +1,269 @@
+// JobTrack database schema (MySQL 8, InnoDB, utf8mb4).
+// Documentation: docs/database/schema.md and docs/database/relationships.md.
+// Every change here needs a migration (`npx prisma migrate dev --name <change>`)
+// and an update to the docs above.
+
+generator client {
+  provider     = "prisma-client"
+  output       = "../lib/generated/prisma"
+  moduleFormat = "esm"
+}
+
+datasource db {
+  provider = "mysql"
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// Display labels, colours and allowed transitions live in lib/applications/status.ts
+// and lib/email/delivery-status.ts — never hard-code these values in UI code.
+// ---------------------------------------------------------------------------
+
+enum ApplicationStatus {
+  DRAFT
+  APPLIED
+  ACKNOWLEDGED
+  HR_SCREENING
+  TECHNICAL_INTERVIEW
+  FINAL_INTERVIEW
+  OFFER
+  REJECTED
+  WITHDRAWN
+  NO_RESPONSE
+}
+
+enum ApplicationSource {
+  LINKEDIN
+  COMPANY_WEBSITE
+  JOB_BOARD
+  REFERRAL
+  RECRUITER
+  EMAIL
+  OTHER
+}
+
+/// Delivery state of a single outgoing email. Independent of ApplicationStatus (ADR-004).
+enum EmailStatus {
+  SENDING
+  SENT
+  DELIVERED
+  BOUNCED
+  COMPLAINT
+  FAILED
+}
+
+enum DocumentType {
+  CV
+  COVER_LETTER
+  OTHER
+}
+
+/// Role a library document plays for a specific application.
+enum ApplicationDocumentRole {
+  CV
+  COVER_LETTER
+  ADDITIONAL
+}
+
+enum ApplicationEventType {
+  APPLICATION_CREATED
+  APPLICATION_UPDATED
+  STATUS_CHANGED
+  EMAIL_SENT
+  EMAIL_FAILED
+  EMAIL_DELIVERED
+  EMAIL_BOUNCED
+  EMAIL_COMPLAINT
+  DOCUMENTS_UPDATED
+  NOTE
+}
+
+// ---------------------------------------------------------------------------
+// Models
+// ---------------------------------------------------------------------------
+
+model Application {
+  id             String            @id @default(cuid())
+  /// Human-readable identifier, e.g. APP-0001. Generated from the Counter table.
+  applicationId  String            @unique @db.VarChar(20)
+  company        String            @db.VarChar(200)
+  position       String            @db.VarChar(200)
+  location       String?           @db.VarChar(200)
+  status         ApplicationStatus @default(DRAFT)
+  source         ApplicationSource @default(OTHER)
+  jobUrl         String?           @db.VarChar(2048)
+  recipientEmail String?           @db.VarChar(320)
+  /// Comma-separated list of addresses (MySQL has no array type).
+  cc             String?           @db.Text
+  /// Comma-separated list of addresses (MySQL has no array type).
+  bcc            String?           @db.Text
+  /// Draft subject/body saved with the application, used to prefill the composer.
+  emailSubject   String?           @db.VarChar(500)
+  emailBody      String?           @db.Text
+  notes          String?           @db.Text
+  dateApplied    DateTime?         @db.Date
+  createdAt      DateTime          @default(now())
+  updatedAt      DateTime          @updatedAt
+
+  techStack     ApplicationTechnology[]
+  emails        Email[]
+  documents     ApplicationDocument[]
+  statusHistory StatusHistory[]
+  events        ApplicationEvent[]
+
+  @@index([status])
+  @@index([source])
+  @@index([dateApplied])
+  @@index([company])
+  @@index([position])
+  @@index([location])
+  @@index([createdAt])
+}
+
+/// One row per technology on an application (normalised tech stack, ADR-005).
+model ApplicationTechnology {
+  id            String      @id @default(cuid())
+  applicationId String
+  name          String      @db.VarChar(100)
+  application   Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+
+  @@unique([applicationId, name])
+  @@index([name])
+}
+
+model Email {
+  id              String      @id @default(cuid())
+  applicationId   String
+  to              String      @db.VarChar(320)
+  cc              String?     @db.Text
+  bcc             String?     @db.Text
+  subject         String      @db.VarChar(500)
+  /// Sanitized HTML body that was sent.
+  body            String      @db.MediumText
+  /// Plain-text alternative part.
+  textBody        String?     @db.MediumText
+  sesMessageId    String?     @unique @db.VarChar(255)
+  emailStatus     EmailStatus @default(SENDING)
+  /// Client-generated key; a unique index makes double submissions impossible.
+  idempotencyKey  String      @unique @db.VarChar(64)
+  errorMessage    String?     @db.Text
+  sentAt          DateTime?
+  statusUpdatedAt DateTime?
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+
+  application Application       @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  attachments EmailAttachment[]
+
+  @@index([applicationId])
+  @@index([emailStatus])
+  @@index([createdAt])
+}
+
+/// Snapshot of which documents were attached to an email.
+model EmailAttachment {
+  id         String  @id @default(cuid())
+  emailId    String
+  /// Nullable so deleting a library document keeps the email history.
+  documentId String?
+  filename   String  @db.VarChar(255)
+  mimeType   String  @db.VarChar(100)
+  size       Int
+
+  email    Email     @relation(fields: [emailId], references: [id], onDelete: Cascade)
+  document Document? @relation(fields: [documentId], references: [id], onDelete: SetNull)
+
+  @@index([emailId])
+  @@index([documentId])
+}
+
+/// A file in the document library (CVs, cover letters, other).
+model Document {
+  id               String       @id @default(cuid())
+  name             String       @db.VarChar(200)
+  type             DocumentType
+  /// Storage key inside the configured storage backend (not a public URL).
+  storageKey       String       @unique @db.VarChar(500)
+  originalFilename String       @db.VarChar(255)
+  mimeType         String       @db.VarChar(100)
+  /// Size in bytes.
+  size             Int
+  /// At most one default per document type (enforced in lib/documents/service.ts).
+  isDefault        Boolean      @default(false)
+  createdAt        DateTime     @default(now())
+  updatedAt        DateTime     @updatedAt
+
+  applications ApplicationDocument[]
+  attachments  EmailAttachment[]
+
+  @@index([type, isDefault])
+}
+
+/// Links library documents to an application with a role (CV, cover letter, additional).
+model ApplicationDocument {
+  id            String                  @id @default(cuid())
+  applicationId String
+  documentId    String
+  role          ApplicationDocumentRole
+  createdAt     DateTime                @default(now())
+
+  application Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  document    Document    @relation(fields: [documentId], references: [id], onDelete: Cascade)
+
+  @@unique([applicationId, documentId])
+  @@index([documentId])
+}
+
+model StatusHistory {
+  id            String             @id @default(cuid())
+  applicationId String
+  /// Null for the initial status assigned at creation.
+  fromStatus    ApplicationStatus?
+  toStatus      ApplicationStatus
+  note          String?            @db.Text
+  createdAt     DateTime           @default(now())
+
+  application Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+
+  @@index([applicationId, createdAt])
+}
+
+model EmailTemplate {
+  id        String   @id @default(cuid())
+  name      String   @unique @db.VarChar(120)
+  subject   String   @db.VarChar(500)
+  /// Plain-text body with {{variables}}; converted to HTML by the composer.
+  body      String   @db.Text
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model ApplicationEvent {
+  id            String               @id @default(cuid())
+  applicationId String
+  eventType     ApplicationEventType
+  description   String               @db.VarChar(500)
+  metadata      Json?
+  createdAt     DateTime             @default(now())
+
+  application Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+
+  @@index([applicationId, createdAt])
+  @@index([eventType])
+}
+
+/// Applicant profile used for template variables ({{name}}, {{email}}, ...). Single row, id = "default".
+model Profile {
+  id        String   @id @default("default") @db.VarChar(20)
+  fullName  String   @default("") @db.VarChar(200)
+  email     String   @default("") @db.VarChar(320)
+  phone     String   @default("") @db.VarChar(50)
+  location  String   @default("") @db.VarChar(200)
+  updatedAt DateTime @updatedAt
+}
+
+/// Named monotonic counters (used for APP-0001 style identifiers).
+model Counter {
+  name  String @id @db.VarChar(50)
+  value Int    @default(0)
+}

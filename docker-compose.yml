@@ -1,0 +1,28 @@
+# Local development / test database. NOT for production.
+# Usage: docker compose up -d   (see docs/setup/database-setup.md)
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: jobtrack-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: jobtrack_root
+      MYSQL_DATABASE: jobtrack
+      MYSQL_USER: jobtrack
+      MYSQL_PASSWORD: jobtrack
+    ports:
+      - "3307:3306"
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_ai_ci
+    volumes:
+      - jobtrack-mysql-data:/var/lib/mysql
+      - ./docker/mysql-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-pjobtrack_root"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  jobtrack-mysql-data:
